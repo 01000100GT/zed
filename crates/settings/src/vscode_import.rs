@@ -268,6 +268,13 @@ impl VsCodeSettings {
             hover_popover_delay: self.read_u64("editor.hover.delay").map(Into::into),
             hover_popover_enabled: self.read_bool("editor.hover.enabled"),
             inline_code_actions: None,
+            code_lens: self.read_bool("editor.codeLens").map(|code_lens| {
+                if code_lens {
+                    CodeLens::On
+                } else {
+                    CodeLens::Off
+                }
+            }),
             jupyter: None,
             lsp_document_colors: None,
             lsp_highlight_debounce: None,
