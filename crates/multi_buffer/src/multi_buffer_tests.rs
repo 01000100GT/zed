@@ -5041,3 +5041,136 @@ fn test_range_to_buffer_ranges_with_range_bounds(cx: &mut App) {
     assert_eq!(ranges_unbounded_trailing[0].2, te_excerpt_1_id);
     assert_eq!(ranges_unbounded_trailing[1].2, te_excerpt_2_id);
 }
+
+// Reproduction for ZED-3W3: "cannot seek backward" panic.
+//
+// The crash happens when `summaries_for_anchors` iterates selection anchors
+// whose excerpt locators are no longer in ascending order after an
+// `update_path_excerpts` call.
+//
+// Scenario:
+//   1. Path B has three excerpts: E_B1, E_B2, E_B3.
+//   2. Path C (sorts after B) has one excerpt: E_C.
+//   3. Anchors are taken in E_B2 and E_B3 (sorted: E_B2 < E_B3).
+//   4. Path B is updated: keep E_B1, remove E_B2 (no overlap → no
+//      `replaced_excerpts` entry), replace E_B3 with N.  N is inserted
+//      after E_B1 so its locator falls between E_B1 and the now-stale
+//      E_B2 locator.
+//   5. Path D (sorts between B and C) is added.  E_D is inserted after
+//      path B's last excerpt (N), so its locator falls between N and E_C.
+//      Because `Locator::between` produces values very close to the left
+//      endpoint, E_D's locator is still less than E_B2's stale locator.
+//   6. Resolving [anchor_in_E_B2, anchor_in_E_B3]:
+//        • Group 1 (E_B2, stale locator): the cursor advances past N
+//          *and* E_D, landing with position = E_D's locator.
+//        • Group 2 (E_B3 → N): the cursor tries to seek to N's locator,
+//          which is *less than* E_D's locator → "cannot seek backward".
+#[gpui::test]
+fn test_cannot_seek_backward_after_excerpt_replacement(cx: &mut TestAppContext) {
+    let buffer_b_text: String = (0..50).map(|i| format!("line_b {i}\n")).collect();
+    let buffer_b = cx.new(|cx| Buffer::local(buffer_b_text, cx));
+
+    let buffer_c_text: String = (0..10).map(|i| format!("line_c {i}\n")).collect();
+    let buffer_c = cx.new(|cx| Buffer::local(buffer_c_text, cx));
+
+    let buffer_d_text: String = (0..10).map(|i| format!("line_d {i}\n")).collect();
+    let buffer_d = cx.new(|cx| Buffer::local(buffer_d_text, cx));
+
+    let path_b = PathKey::with_sort_prefix(0, rel_path("bbb.rs").into_arc());
+    let path_c = PathKey::with_sort_prefix(0, rel_path("ddd.rs").into_arc());
+    let path_d = PathKey::with_sort_prefix(0, rel_path("ccc.rs").into_arc());
+
+    let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));
+
+    // Step 1 – create excerpts for Path B (three well-separated regions).
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(
+            path_b.clone(),
+            buffer_b.clone(),
+            vec![
+                Point::row_range(0..3),
+                Point::row_range(15..18),
+                Point::row_range(30..33),
+            ],
+            0,
+            cx,
+        );
+    });
+
+    // Step 2 – create an excerpt for Path C (sorts after B and D).
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(
+            path_c.clone(),
+            buffer_c.clone(),
+            vec![Point::row_range(0..3)],
+            0,
+            cx,
+        );
+    });
+
+    // Step 3 – snapshot V1: take anchors in E_B2 and E_B3.
+    let (anchor_in_e_b2, anchor_in_e_b3) = multibuffer.read_with(cx, |multibuffer, cx| {
+        let snapshot = multibuffer.snapshot(cx);
+        let excerpt_ids: Vec<ExcerptId> = snapshot.excerpts().map(|(id, _, _)| id).collect();
+        assert_eq!(excerpt_ids.len(), 4, "expected 4 excerpts (3×B + 1×C)");
+
+        let e_b2_id = excerpt_ids[1];
+        let e_b3_id = excerpt_ids[2];
+
+        let e_b2 = snapshot.excerpt(e_b2_id).expect("E_B2 should exist");
+        let e_b3 = snapshot.excerpt(e_b3_id).expect("E_B3 should exist");
+
+        let anchor_b2 = Anchor::in_buffer(e_b2_id, e_b2.range.context.start);
+        let anchor_b3 = Anchor::in_buffer(e_b3_id, e_b3.range.context.start);
+        (anchor_b2, anchor_b3)
+    });
+
+    // Step 4 – update Path B: keep E_B1 (exact match rows 0..3),
+    // drop E_B2 (rows 15..18 has no overlap with the new set),
+    // replace E_B3 with N (rows 28..36 partially overlaps rows 30..33).
+    //
+    // N is inserted after E_B1, so its locator is between E_B1 and
+    // the (about-to-be-removed) E_B2.  E_B2 is removed without a
+    // `replaced_excerpts` entry, but its old locator persists in
+    // `excerpt_ids`.
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(
+            path_b.clone(),
+            buffer_b.clone(),
+            vec![Point::row_range(0..3), Point::row_range(28..36)],
+            0,
+            cx,
+        );
+    });
+
+    // Step 5 – add Path D (sorts between B and C).  Its excerpt E_D is
+    // inserted after path B's last excerpt (N).  Because
+    // `Locator::between` yields a value very close to its left operand,
+    // E_D's locator sits between N and E_B2's stale locator.
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(
+            path_d.clone(),
+            buffer_d.clone(),
+            vec![Point::row_range(0..3)],
+            0,
+            cx,
+        );
+    });
+
+    // Step 6 – resolve the old anchors against the current snapshot.
+    //
+    // summaries_for_anchors iterates:
+    //   anchor_in_E_B2  →  latest_excerpt_id = E_B2 (no mapping)
+    //                       locator = E_B2's stale locator
+    //   anchor_in_E_B3  →  latest_excerpt_id = N (via replaced_excerpts)
+    //                       locator = N's locator
+    //
+    // The cursor seeks forward to E_B2's stale locator first, passing N
+    // *and* E_D (whose locator is between N and the stale locator).
+    // Then it tries to seek forward to N's locator, which is behind
+    // E_D → panic: "cannot seek backward".
+    multibuffer.read_with(cx, |multibuffer, cx| {
+        let snapshot = multibuffer.snapshot(cx);
+        snapshot.summaries_for_anchors::<Point, _>(&[anchor_in_e_b2, anchor_in_e_b3]);
+    });
+}
